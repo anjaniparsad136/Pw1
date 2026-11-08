@@ -22,19 +22,36 @@ jobs:
       - name: Setup Android SDK (no obsolete tools package)
         run: |
           set -euo pipefail
-          ANDROID_HOME="${HOME}/android-sdk"
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          cd /tmp
-          curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          rm -rf cmdline-tools
-          unzip -q cmdtools.zip
-          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
-          mv cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          # Prefer runner preinstalled SDK (same idea as your first working workflow)
+          if [ -d /usr/local/lib/android/sdk ]; then
+            ANDROID_HOME=/usr/local/lib/android/sdk
+          else
+            ANDROID_HOME="${HOME}/android-sdk"
+          fi
+          mkdir -p "$ANDROID_HOME/licenses"
+          echo -e "24333f0d63266f7550456170d6526017b2b52b31\n84831b400904a625014312442624b864d08ee730" > "$ANDROID_HOME/licenses/android-sdk-license"
+
+          # Ensure cmdline-tools exist
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            cd /tmp
+            curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf cmdline-tools
+            unzip -q cmdtools.zip
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mv cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          fi
+
+          SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SM"
+          # Call with FULL path in this same step (GITHUB_PATH does not apply until next step)
+          yes | "$SM" --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          "$SM" --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
-          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
-          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
 
       - name: Write project
@@ -398,36 +415,63 @@ jobs:
           }
           EOF
 
-          cat > app/src/main/java/ai/venice/pw/core/Modem.kt <<'EOF'
+                    cat > app/src/main/java/ai/venice/pw/core/Modem.kt <<'EOF'
           package ai.venice.pw.core
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.withContext
-          /** Diagnose only. Never writes EFS/mcfg/radio partitions. */
+          /**
+           * Read-only modem/EFS diagnostics.
+           * Knows common Qualcomm EFS-related names: modemst1, modemst2, fsg, fsc.
+           * NEVER writes those partitions from this app.
+           */
           object Modem {
             data class Report(val verdict: String, val lines: List<String>, val plan: String)
+            private val efsNames = listOf("modemst1", "modemst2", "fsg", "fsc", "modem", "mdm1m9kefs1", "mdm1m9kefs2", "mdm1m9kefsc")
             suspend fun diagnose(): Report = withContext(Dispatchers.IO) {
               val lines = mutableListOf<String>()
               fun add(cmd: String, label: String) {
-                val o = Shell.root(cmd).lines().filter { it.isNotBlank() }.take(30)
+                val o = Shell.root(cmd).lines().filter { it.isNotBlank() }.take(40)
                 lines += "# $label"
                 lines += o.ifEmpty { listOf("(empty)") }
               }
-              add("getprop | grep -iE 'gsm|ril|radio|operator|network|baseband|mcfg'", "props")
-              add("dumpsys telephony.registry 2>/dev/null | head -40", "telephony")
-              add("logcat -b radio -d 2>/dev/null | tail -40", "radio log tail")
-              val noSvc = lines.any { it.contains("OUT_OF_SERVICE", true) || it.contains("ENFORCE", true) }
+              add("getprop | grep -iE 'gsm|ril|radio|operator|network|baseband|mcfg|persist.vendor.radio|ro.baseband'", "radio props")
+              add("dumpsys telephony.registry 2>/dev/null | head -50", "telephony.registry")
+              add("logcat -b radio -d 2>/dev/null | tail -50", "radio log tail")
+              add("ls -l /dev/block/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|st1|st2'", "by-name partitions")
+              add("ls -l /dev/block/bootdevice/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|st1|st2'", "bootdevice by-name")
+              // Presence only — no read of raw partition contents (privacy + safety)
+              for (n in efsNames) {
+                val hit = Shell.root("ls -l /dev/block/by-name/$n /dev/block/bootdevice/by-name/$n 2>/dev/null")
+                if (hit.isNotBlank() && !hit.startsWith("ERR")) {
+                  lines += "# partition $n"
+                  lines += hit.lines().filter { it.isNotBlank() }
+                }
+              }
+              add("getprop ro.boot.baseband; getprop gsm.version.baseband; getprop persist.radio.multisim.config", "baseband/multisim")
+              val hasSt1 = lines.any { it.contains("modemst1") }
+              val hasSt2 = lines.any { it.contains("modemst2") }
+              val hasFsg = lines.any { it.contains("fsg") }
+              val hasFsc = lines.any { it.contains("fsc") }
+              lines += "# efs-related nodes: modemst1=$hasSt1 modemst2=$hasSt2 fsg=$hasFsg fsc=$hasFsc"
+              val noSvc = lines.any { it.contains("OUT_OF_SERVICE", true) || it.contains("not searching", true) }
               val verdict = when {
                 lines.any { it.contains("mcfg", true) && it.contains("fail", true) } ->
-                  "Possible mcfg/config issue — restore EFS from backup only (app will not write EFS)."
-                noSvc -> "Radio reports out of service — check SIM, baseband, and EFS backup restore."
-                else -> "Collected modem-related signals. No automatic flash. Use known-good EFS restore if you broke radio."
+                  "Possible mcfg/config issue. Restore EFS (modemst1/2, fsg, fsc) from YOUR backup only."
+                noSvc && (hasSt1 || hasFsg) ->
+                  "No service + EFS nodes present. Likely bad EFS/mcfg write earlier — restore backup, do not random-flash."
+                noSvc ->
+                  "Radio out of service — check SIM, baseband prop, and whether modemst1/st2/fsg/fsc were modified."
+                else ->
+                  "Collected modem/EFS node info. App does not write modemst1, modemst2, fsg, or fsc."
               }
               val plan = """
-                SAFE PLAN (manual):
-                1) Do not flash random mcfg from this app.
-                2) If you have EFS backup from before the break: restore with QPST/engineering tool for your model.
-                3) Confirm model/region mcfg matches firmware.
-                4) Re-test network search after restore + reboot.
+                SAFE PLAN (manual — this app never flashes these):
+                Partitions often involved on Qualcomm: modemst1, modemst2, fsg, fsc
+                1) If radio broke after mcfg/EFS write: restore those partitions from a backup taken on THIS phone before the change.
+                2) Tools: model-specific (QPST/QFIL/client EFS explore) — not Magisk zip guesswork.
+                3) Matching firmware + region mcfg required.
+                4) After restore: reboot, test network search, *#*#4636#*#* if available.
+                5) Do not format fsg/fsc unless you know your device policy; empty FSG recovery is device-specific.
               """.trimIndent()
               Report(verdict, lines, plan)
             }
