@@ -1,3 +1,4 @@
+
 name: build
 on: [push, workflow_dispatch]
 
@@ -9,20 +10,18 @@ jobs:
 
       - uses: actions/setup-java@v5
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '17'
-
 
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
       - name: Accept Android SDK Licenses Automatically
-          run: |
-            mkdir -p /usr/local/lib/android/sdk/licenses
-            echo "24333f0d63266f7550456170d6526017b2b52b31" > /usr/local/lib/android/sdk/licenses/android-sdk-license
-            echo "84831b400904a625014312442624b864d08ee730" >> /usr/local/lib/android/sdk/licenses/android-sdk-license
-
-
+        run: |
+          mkdir -p /usr/local/lib/android/sdk/licenses
+          echo "24333f0d63266f7550456170d6526017b2b52b31" > /usr/local/lib/android/sdk/licenses/android-sdk-license
+          echo "84831b400904a625014312442624b864d08ee730" >> /usr/local/lib/android/sdk/licenses/android-sdk-license
       
       - name: write project
         run: |
