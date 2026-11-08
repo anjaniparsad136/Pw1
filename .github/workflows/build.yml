@@ -12,7 +12,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      
+      - name: Run sdkmanager
+      env:
+        ANDROID_HOME: /usr/local/lib/android/sdk
+      run: |
+        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+        sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
