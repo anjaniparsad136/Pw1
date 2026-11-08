@@ -1,0 +1,1175 @@
+name: build
+on: [push, workflow_dispatch]
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: write project
+        run: |
+          set -e
+          mkdir -p app/src/main/java/ai/venice/pw/core
+          mkdir -p app/src/main/java/ai/venice/pw/data
+          mkdir -p app/src/main/java/ai/venice/pw/patch
+          mkdir -p app/src/main/java/ai/venice/pw/rules
+          mkdir -p app/src/main/java/ai/venice/pw/ui
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts <<'XEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+            repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+            repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "pw"
+          include(":app")
+          XEOF
+
+          cat > build.gradle.kts <<'XEOF'
+          plugins {
+            id("com.android.application") version "8.7.2" apply false
+            id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+            id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          XEOF
+
+          cat > gradle.properties <<'XEOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          android.suppressUnsupportedCompileSdk=35
+          XEOF
+
+          cat > app/build.gradle.kts <<'XEOF'
+          plugins {
+            id("com.android.application")
+            id("org.jetbrains.kotlin.android")
+            id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+            namespace = "ai.venice.pw"
+            compileSdk = 35
+            defaultConfig {
+              applicationId = "ai.venice.pw"
+              minSdk = 28
+              targetSdk = 35
+              versionCode = 8
+              versionName = "8.0"
+            }
+            buildFeatures { compose = true }
+            compileOptions {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+            }
+            kotlinOptions { jvmTarget = "17" }
+            lint { abortOnError = false; checkReleaseBuilds = false }
+            packaging { resources.excludes += "META-INF/*.kotlin_module" }
+          }
+          dependencies {
+            implementation(platform("androidx.compose:compose-bom:2024.10.01"))
+            implementation("androidx.compose.ui:ui")
+            implementation("androidx.compose.material3:material3")
+            implementation("androidx.activity:activity-compose:1.9.3")
+            implementation("androidx.core:core-ktx:1.13.1")
+            implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          XEOF
+
+          cat > app/src/main/res/values/strings.xml <<'XEOF'
+          <resources><string name="app_name">Patchwright</string></resources>
+          XEOF
+
+          cat > app/src/main/res/values/colors.xml <<'XEOF'
+          <resources><color name="bg">#101014</color></resources>
+          XEOF
+
+          cat > app/src/main/res/values/themes.xml <<'XEOF'
+          <resources><style name="Theme.Pw" parent="android:Theme.Material.NoActionBar"><item name="android:windowBackground">@color/bg</item></style></resources>
+          XEOF
+
+          cat > app/src/main/AndroidManifest.xml <<'XEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.READ_LOGS" />
+            <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+            <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+            <application
+              android:name=".App"
+              android:allowBackup="false"
+              android:label="@string/app_name"
+              android:theme="@style/Theme.Pw">
+              <activity
+                android:name=".ui.MainActivity"
+                android:configChanges="orientation|screenSize|uiMode|keyboardHidden"
+                android:exported="true">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+              <service
+                android:name=".core.LogReader"
+                android:exported="false"
+                android:foregroundServiceType="dataSync" />
+            </application>
+          </manifest>
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/App.kt <<'XEOF'
+          package ai.venice.pw
+          import android.app.Application
+          import ai.venice.pw.core.Env
+          import ai.venice.pw.core.Shell
+          import ai.venice.pw.rules.Learn
+          import kotlinx.coroutines.*
+          class App : Application() {
+              val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              override fun onCreate() {
+                  super.onCreate()
+                  Learn.init(this)
+                  scope.launch { Env.refresh(); Shell.exec("mkdir -p /data/adb/pw/snap") }
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Shell.kt <<'XEOF'
+          package ai.venice.pw.core
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.concurrent.TimeUnit
+          enum class Mode { ROOT, ADB, SANDBOX }
+          object Shell {
+              @Volatile var mode = Mode.SANDBOX
+                  private set
+              suspend fun detect(): Mode = withContext(Dispatchers.IO) {
+                  val r = raw("su -c id", 6)
+                  mode = when {
+                      r.contains("uid=0") -> Mode.ROOT
+                      raw("id", 5).contains("uid=2000") -> Mode.ADB
+                      else -> Mode.SANDBOX
+                  }
+                  mode
+              }
+              suspend fun exec(c: String, t: Long = 25): String = withContext(Dispatchers.IO) {
+                  if (mode == Mode.ROOT) raw("su -c ${q(c)}", t) else raw(c, t)
+              }
+              suspend fun root(c: String, t: Long = 40): String = withContext(Dispatchers.IO) { raw("su -c ${q(c)}", t) }
+              suspend fun hasRoot(): Boolean = withContext(Dispatchers.IO) { raw("su -c id", 6).contains("uid=0") }
+              suspend fun put(local: File, dest: String, perms: String = "600"): Boolean = withContext(Dispatchers.IO) {
+                  root("mkdir -p ${dest.substringBeforeLast('/')}")
+                  root("cp '${local.absolutePath}' '$dest'")
+                  root("chown root:root '$dest'; chmod $perms '$dest'")
+                  root("test -s '$dest' && echo OK").contains("OK")
+              }
+              private fun raw(c: String, t: Long): String = try {
+                  val p = ProcessBuilder("/system/bin/sh", "-c", c).redirectErrorStream(true).start()
+                  val sb = StringBuilder()
+                  p.inputStream.bufferedReader().useLines { it.forEach { l -> sb.append(l).append('\n') } }
+                  if (!p.waitFor(t, TimeUnit.SECONDS)) { p.destroyForcibly(); sb.append("[timeout]") }
+                  sb.toString().trim()
+              } catch (e: Throwable) { "ERR ${e.message}" }
+              private fun q(s: String) = "'" + s.replace("'", "'\\''") + "'"
+              suspend fun stream(c: String, onLine: (String) -> Unit): Process? = withContext(Dispatchers.IO) {
+                  try {
+                      val p = ProcessBuilder("/system/bin/sh", "-c", c).redirectErrorStream(true).start()
+                      Thread { runCatching { p.inputStream.bufferedReader().useLines { l -> l.forEach(onLine) } } }
+                          .apply { isDaemon = true }.start()
+                      p
+                  } catch (e: Throwable) { onLine("ERR ${e.message}"); null }
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Env.kt <<'XEOF'
+          package ai.venice.pw.core
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          object Env {
+              data class State(val root: Boolean = false, val magisk: Boolean = false, val kernelsu: Boolean = false,
+                  val apatch: Boolean = false, val resetprop: Boolean = false, val magiskpolicy: Boolean = false,
+                  val tricky: Boolean = false, val zipalign: Boolean = false, val apksigner: Boolean = false) {
+                  val canPatch get() = root && (magisk || kernelsu || apatch)
+                  val canModule get() = root && magisk
+              }
+              @Volatile var state = State()
+                  private set
+              private suspend fun has(b: String) = withContext(Dispatchers.IO) {
+                  val r = Shell.root("command -v $b 2>/dev/null"); r.isNotBlank() && !r.startsWith("ERR")
+              }
+              suspend fun refresh(): State = withContext(Dispatchers.IO) {
+                  Shell.detect(); val r = Shell.hasRoot()
+                  state = State(root = r,
+                      magisk = r && Shell.root("magisk -v").contains("MAGISK", true),
+                      kernelsu = r && Shell.root("ksud -v").contains("Kernel", true),
+                      apatch = r && Shell.root("apd --version").contains("APatch", true),
+                      resetprop = r && has("resetprop"),
+                      magiskpolicy = r && has("magiskpolicy"),
+                      tricky = r && Shell.root("test -d /data/adb/tricky_store && echo y").contains("y"),
+                      zipalign = has("zipalign"), apksigner = has("apksigner"))
+                  state
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Ring.kt <<'XEOF'
+          package ai.venice.pw.core
+          class Ring<T>(private val cap: Int) {
+              private val a = arrayOfNulls<Any?>(cap)
+              private var n = 0
+              private var h = 0
+              @Synchronized fun add(v: T) { a[h] = v; h = (h + 1) % cap; if (n < cap) n++ }
+              @Synchronized fun snapshot(): List<T> {
+                  val o = ArrayList<T>(n); val s = if (n < cap) 0 else h
+                  for (i in 0 until n) { @Suppress("UNCHECKED_CAST") o.add(a[(s + i) % cap] as T) }
+                  return o
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Surface.kt <<'XEOF'
+          package ai.venice.pw.core
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          data class Finding(val id: String, val sev: Int, val detail: String)
+          object Surface {
+              private val bad = mapOf("ro.debuggable" to "1", "ro.secure" to "0", "ro.build.tags" to "test-keys",
+                  "ro.build.type" to "userdebug", "ro.boot.verifiedbootstate" to "orange",
+                  "ro.boot.flash.locked" to "0", "ro.boot.veritymode" to "disabled",
+                  "service.adb.root" to "1", "ro.kernel.qemu" to "1")
+              private val paths = listOf("/system/bin/su", "/system/xbin/su", "/sbin/su", "/data/adb/magisk",
+                  "/data/adb/modules", "/data/adb/ksu", "/data/adb/ap", "/data/adb/lspd",
+                  "/data/local/tmp/frida-server", "/debug_ramdisk", "/data/adb/tricky_store")
+              suspend fun props(): List<Finding> = withContext(Dispatchers.IO) {
+                  val d = Shell.exec("getprop")
+                  bad.mapNotNull { (k, v) ->
+                      val g = Regex("""\[$k]: \[(.*?)]""").find(d)?.groupValues?.get(1) ?: return@mapNotNull null
+                      if (g == v) Finding("prop.$k", 3, "$k=$g") else null
+                  }
+              }
+              suspend fun paths(): List<Finding> = withContext(Dispatchers.IO) {
+                  val c = paths.joinToString(" ") { "test -e $it && echo $it" }
+                  Shell.exec(c).lines().filter { it.startsWith("/") }.map { Finding("path.$it", 2, it) }
+              }
+              suspend fun misc(): List<Finding> = withContext(Dispatchers.IO) {
+                  val o = mutableListOf<Finding>()
+                  if (Shell.exec("getenforce").equals("Permissive", true)) o += Finding("selinux", 3, "permissive")
+                  if (Shell.exec("cat /proc/self/mountinfo").contains("magisk")) o += Finding("mount.magisk", 3, "visible")
+                  o
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/LogReader.kt <<'XEOF'
+          package ai.venice.pw.core
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import ai.venice.pw.data.Repo
+          import kotlinx.coroutines.*
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          class LogReader : Service() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private var p: Process? = null
+              private val pids = HashMap<Int, String>()
+              private val ts = SimpleDateFormat("HH:mm:ss", Locale.US)
+              private val re = Regex("^\\d{2}-\\d{2}\\s+(\\d{2}:\\d{2}:\\d{2})\\.\\d+\\s+(\\d+)\\s+\\d+\\s+([VDIWEF])\\s+([^:]*?)\\s*: (.*)$")
+              override fun onBind(i: Intent?): IBinder? = null
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  val n = notif()
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                  else startForeground(1, n)
+                  scope.launch {
+                      Shell.root("pm grant $packageName android.permission.READ_LOGS")
+                      launch { mapPids() }
+                      val cmd = if (Shell.mode == Mode.ROOT) "su -c 'logcat -v threadtime -b main -b system -b crash -b radio'"
+                      else "logcat -v threadtime -b main -b system -b crash"
+                      p = Shell.stream(cmd) { ingest(it) }
+                  }
+                  return START_STICKY
+              }
+              private fun ingest(l: String) {
+                  val m = re.find(l)
+                  val time: String; val pid: Int; val lvl: String; val tag: String; val msg: String
+                  if (m != null) {
+                      time = m.groupValues[1]; pid = m.groupValues[2].toIntOrNull() ?: 0
+                      lvl = m.groupValues[3]; tag = m.groupValues[4]; msg = m.groupValues[5]
+                  } else { time = ts.format(Date()); pid = 0; lvl = "?"; tag = ""; msg = l }
+                  val pkg = pids[pid] ?: if (pid == 0) "-" else "pid:$pid"
+                  Repo.log("$time $lvl/$tag [$pkg] $msg")
+                  Repo.ruleHit(pkg, tag, msg)
+              }
+              private suspend fun mapPids() {
+                  while (true) {
+                      pids.clear()
+                      Shell.exec("ps -A -o PID,NAME").lines().drop(1).forEach { l ->
+                          val a = l.trim().split(Regex("\\s+"), limit = 2)
+                          val id = a.getOrNull(0)?.toIntOrNull() ?: return@forEach
+                          val nm = a.getOrNull(1) ?: return@forEach
+                          if (nm.contains('.')) pids[id] = nm
+                      }
+                      delay(4000)
+                  }
+              }
+              private fun notif(): Notification {
+                  if (Build.VERSION.SDK_INT >= 26)
+                      (getSystemService(NOTIFICATION_SERVICE) as NotificationManager)
+                          .createNotificationChannel(NotificationChannel("p", "capture", 2))
+                  return NotificationCompat.Builder(this, "p").setContentTitle("capturing").setOngoing(true)
+                      .setSmallIcon(android.R.drawable.stat_sys_download).build()
+              }
+              override fun onDestroy() { p?.destroy(); scope.cancel(); super.onDestroy() }
+              companion object {
+                  fun start(c: Context) = c.startForegroundService(Intent(c, LogReader::class.java))
+                  fun stop(c: Context) = c.stopService(Intent(c, LogReader::class.java))
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Attest.kt <<'XEOF'
+          package ai.venice.pw.core
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.security.KeyPairGenerator
+          import java.security.KeyStore
+          import java.security.spec.ECGenParameterSpec
+          object Attest {
+              private const val OID = "1.3.6.1.4.1.11129.2.1.17"
+              private const val ROT = "1.3.6.1.4.1.11129.2.1.22"
+              suspend fun probe(): String = withContext(Dispatchers.IO) {
+                  runCatching {
+                      val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                      val a = "pw-att"
+                      if (ks.containsAlias(a)) ks.deleteEntry(a)
+                      val g = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+                      g.initialize(KeyGenParameterSpec.Builder(a, KeyProperties.PURPOSE_SIGN)
+                          .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                          .setDigests(KeyProperties.DIGEST_SHA256)
+                          .setAttestationChallenge("pw".toByteArray()).build())
+                      g.generateKeyPair()
+                      val c = ks.getCertificateChain(a).first() as java.security.cert.X509Certificate
+                      val ext = c.getExtensionValue(OID) ?: return@runCatching "no attestation extension"
+                      val der = Der.read(ext, 0)?.v ?: ext
+                      val kids = Der.read(der, 0)?.let { Der.kids(it) } ?: emptyList()
+                      val o = StringBuilder()
+                      o.appendLine("level=" + when (kids.getOrNull(1)?.let { Der.n(it) }) {
+                          0 -> "Software"; 1 -> "TEE"; 2 -> "StrongBox"; else -> "?" })
+                      for (i in listOf(7, 6)) {
+                          val e = kids.getOrNull(i) ?: continue
+                          for (x in Der.kids(e)) {
+                              if (Der.oid(x) != ROT) continue
+                              for (r in Der.kids(x)) when (r.tag) {
+                                  0x82 -> o.appendLine("bootState=" + when (Der.n(r)) {
+                                      0 -> "Verified"; 1 -> "SelfSigned"; 2 -> "Unverified"; 3 -> "Failed"; else -> "?" })
+                                  0x81 -> o.appendLine("locked=" + Der.b(r))
+                              }
+                          }
+                      }
+                      ks.deleteEntry(a); o.toString()
+                  }.getOrElse { "ERR ${it.message}" }
+              }
+          }
+          object Der {
+              class T(val tag: Int, val v: ByteArray)
+              fun read(b: ByteArray, o: Int): T? {
+                  if (o + 2 > b.size) return null
+                  val t = b[o].toInt() and 0xFF
+                  var p = o + 1
+                  var l = b[p++].toInt() and 0xFF
+                  if (l and 0x80 != 0) {
+                      val n = l and 0x7F
+                      if (n < 1 || n > 3 || p + n > b.size) return null
+                      l = 0; repeat(n) { l = (l shl 8) or (b[p++].toInt() and 0xFF) }
+                  }
+                  if (p + l > b.size) return null
+                  return T(t, b.copyOfRange(p, p + l))
+              }
+              fun kids(t: T): List<T> {
+                  val o = mutableListOf<T>(); var i = 0
+                  while (i < t.v.size) { val c = read(t.v, i) ?: break; o += c; i += hl(t.v, i) + c.v.size }
+                  return o
+              }
+              private fun hl(b: ByteArray, o: Int): Int {
+                  var p = o + 1; val l = b[p++].toInt() and 0xFF
+                  if (l and 0x80 != 0) p += (l and 0x7F)
+                  return p - o
+              }
+              fun n(t: T) = t.v.fold(0) { a, c -> (a shl 8) or (c.toInt() and 0xFF) }
+              fun b(t: T) = t.v.any { it.toInt() != 0 }
+              fun oid(t: T): String {
+                  if (t.v.isEmpty()) return ""
+                  val s = StringBuilder(); val f = t.v[0].toInt() and 0xFF
+                  s.append(f / 40).append('.').append(f % 40); var v = 0
+                  for (i in 1 until t.v.size) {
+                      val c = t.v[i].toInt() and 0xFF; v = (v shl 7) or (c and 0x7F)
+                      if (c and 0x80 == 0) { s.append('.').append(v); v = 0 }
+                  }
+                  return s.toString()
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Modem.kt <<'XEOF'
+          package ai.venice.pw.core
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          object Modem {
+              data class Report(val lines: List<String>, val verdict: String, val plan: String)
+              suspend fun diagnose(): Report = withContext(Dispatchers.IO) {
+                  val l = mutableListOf<String>()
+                  fun add(k: String, v: String) = l.add("$k: ${v.ifBlank { "-" }}")
+                  add("baseband", Shell.exec("getprop gsm.version.baseband"))
+                  add("sim", Shell.exec("getprop gsm.sim.state"))
+                  val tele = Shell.root("dumpsys telephony.registry | grep -E 'mServiceState' | head -5")
+                  add("telephony", tele)
+                  val sub = Shell.root("for d in /sys/bus/msm_subsys/devices/*/name; do cat \$d; done 2>/dev/null")
+                  add("subsys", sub.replace("\n", ","))
+                  add("ramdump", Shell.root("ls /data/vendor/ramdump 2>/dev/null | tail -3"))
+                  add("fw mcfg", Shell.root("ls /vendor/firmware_mnt/image 2>/dev/null | grep -i mcfg"))
+                  val radio = Shell.root("logcat -b radio -d 2>/dev/null | grep -iE 'mcfg|qmi|uim|attach' | tail -25")
+                  l.add("--- radio ---"); l.addAll(radio.lines().take(25))
+                  val km = Shell.root("dmesg | grep -iE 'subsys|qmi|mcfg' | tail -25")
+                  l.add("--- kernel ---"); l.addAll(km.lines().take(25))
+                  val v = when {
+                      sub.isBlank() -> "modem subsystem not enumerating"
+                      l.any { it.startsWith("ramdump:") && it.length > 10 } -> "modem crash dumps present"
+                      tele.contains("OUT_OF_SERVICE", true) && radio.contains("mcfg", true) -> "mcfg rejected, radio OOS"
+                      radio.contains("UIM_GET_CARD_STATUS", true) -> "SIM not reaching UIM"
+                      else -> "no hard fault signature"
+                  }
+                  Report(l, v, plan(v))
+              }
+              private fun plan(v: String) = """
+          dd if=/dev/block/bootdevice/by-name/fsg of=/sdcard/fsg.img
+          dd if=/dev/block/bootdevice/by-name/modemst1 of=/sdcard/modemst1.img
+          sha256sum /sdcard/fsg.img
+          # 1 flash fsg.mbn from matching firmware
+          # 2 remove injected mcfg from EFS so firmware copy wins
+          # 3 only then erase modemst1/2
+          # 4 svc data disable; svc data enable
+          # verdict: $v
+          """.trimIndent()
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Keybox.kt <<'XEOF'
+          package ai.venice.pw.core
+          import android.util.Base64
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.ByteArrayInputStream
+          import java.security.KeyFactory
+          import java.security.Signature
+          import java.security.cert.CertificateFactory
+          import java.security.cert.X509Certificate
+          import java.security.spec.PKCS8EncodedKeySpec
+          object Keybox {
+              enum class S { VALID, EXPIRED, BROKEN, MALFORMED }
+              data class C(val pem: String, val certs: List<X509Certificate>, val st: S, val notes: List<String>, val days: Long)
+              suspend fun parse(xml: String): C = withContext(Dispatchers.IO) {
+                  val n = mutableListOf<String>()
+                  val cf = CertificateFactory.getInstance("X.509")
+                  val bl = Regex("-----BEGIN CERTIFICATE-----[\\s\\S]*?-----END CERTIFICATE-----").findAll(xml).map { it.value }.toList()
+                  val k = Regex("-----BEGIN (?:EC )?PRIVATE KEY-----[\\s\\S]*?-----END (?:EC )?PRIVATE KEY-----").find(xml)?.value
+                      ?: return@withContext bad("no key")
+                  if (bl.size < 2) return@withContext bad("chain ${bl.size}")
+                  val cs = bl.mapNotNull { runCatching { cf.generateCertificate(ByteArrayInputStream(it.toByteArray())) as X509Certificate }.getOrNull() }
+                  if (cs.size != bl.size) return@withContext bad("bad cert")
+                  var ok = true
+                  for (i in 0 until cs.size - 1)
+                      if (!runCatching { cs[i].verify(cs[i + 1].publicKey); true }.getOrDefault(false)) { ok = false; n += "cert[$i] unsigned" }
+                  val d = (cs.first().notAfter.time - System.currentTimeMillis()) / 86400000L
+                  if (d < 0) n += "expired"
+                  C(k, cs, when { !ok -> S.BROKEN; d < 0 -> S.EXPIRED; else -> S.VALID }, n, d)
+              }
+              private fun bad(m: String) = C("", emptyList(), S.MALFORMED, listOf(m), 0)
+              fun xml(c: C) = buildString {
+                  appendLine("<?xml version=\"1.0\"?>")
+                  appendLine("<Keybox DeviceID=\"pw\"><Key algorithm=\"ecdsa\">")
+                  appendLine("<PrivateKey format=\"pem\">${c.pem}</PrivateKey><CertificateChain>")
+                  appendLine("<NumberOfCertificates>${c.certs.size}</NumberOfCertificates>")
+                  c.certs.forEach { appendLine("<Certificate format=\"pem\">" + Base64.encodeToString(it.encoded, 2) + "</Certificate>") }
+                  append("</CertificateChain></Key></Keybox>")
+              }
+              fun test(c: C) = runCatching {
+                  val pk = KeyFactory.getInstance("EC").generatePrivate(PKCS8EncodedKeySpec(
+                      Base64.decode(c.pem.replace(Regex("-----[^-]+-----"), "").replace(Regex("\\s"), ""), 0)))
+                  val s = Signature.getInstance("SHA256withECDSA").apply { initSign(pk) }
+                  s.update("pw".toByteArray()); val sig = s.sign()
+                  val v = Signature.getInstance("SHA256withECDSA").apply { initVerify(c.certs.first().publicKey) }
+                  v.update("pw".toByteArray()); v.verify(sig)
+              }.getOrDefault(false)
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/KeyboxStore.kt <<'XEOF'
+          package ai.venice.pw.core
+          import android.content.Context
+          import android.security.keystore.KeyGenParameterSpec
+          import android.security.keystore.KeyProperties
+          import android.util.Base64
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.security.KeyStore
+          import javax.crypto.Cipher
+          import javax.crypto.KeyGenerator
+          import javax.crypto.SecretKey
+          import javax.crypto.spec.GCMParameterSpec
+          object KeyboxStore {
+              private fun key(): SecretKey {
+                  val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+                  (ks.getEntry("pw-kb", null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
+                  val g = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+                  g.init(KeyGenParameterSpec.Builder("pw-kb", KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+                      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setKeySize(256).build())
+                  return g.generateKey()
+              }
+              suspend fun save(c: Context, x: String) = withContext(Dispatchers.IO) {
+                  val ci = Cipher.getInstance("AES/GCM/NoPadding").apply { init(Cipher.ENCRYPT_MODE, key()) }
+                  File(c.filesDir, "kb.enc").writeText(Base64.encodeToString(ci.iv, 2) + ":" + Base64.encodeToString(ci.doFinal(x.toByteArray()), 2))
+              }
+              suspend fun load(c: Context): String? = withContext(Dispatchers.IO) {
+                  val f = File(c.filesDir, "kb.enc")
+                  if (!f.exists()) return@withContext null
+                  runCatching {
+                      val p = f.readText().split(":")
+                      val ci = Cipher.getInstance("AES/GCM/NoPadding")
+                      ci.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, Base64.decode(p[0], 2)))
+                      String(ci.doFinal(Base64.decode(p[1], 2)))
+                  }.getOrNull()
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/core/Snapshot.kt <<'XEOF'
+          package ai.venice.pw.core
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+          object Snapshot {
+              private const val D = "/data/adb/pw/snap"
+              suspend fun take(): String = withContext(Dispatchers.IO) {
+                  val id = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+                  Shell.root("mkdir -p $D/$id"); Shell.root("getprop > $D/$id/props.txt")
+                  Shell.root("sysctl -a > $D/$id/sysctl.txt 2>/dev/null"); Shell.root("chmod -R 600 $D/$id")
+                  id
+              }
+              suspend fun restore(id: String): String = withContext(Dispatchers.IO) {
+                  var n = 0
+                  Shell.root("cat $D/$id/props.txt").lines().forEach { l ->
+                      val m = Regex("""\[(.*?)]: \[(.*?)]""").find(l) ?: return@forEach
+                      val k = m.groupValues[1]
+                      if (k.startsWith("persist.") || k.startsWith("ro.")) { Shell.root("resetprop -n $k ${m.groupValues[2]}"); n++ }
+                  }
+                  "restored $n"
+              }
+              suspend fun list(): List<String> = withContext(Dispatchers.IO) { Shell.root("ls $D 2>/dev/null").lines().filter { it.isNotBlank() } }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/data/Repo.kt <<'XEOF'
+          package ai.venice.pw.data
+          import ai.venice.pw.core.Finding
+          import ai.venice.pw.core.Ring
+          import ai.venice.pw.rules.Learn
+          import kotlinx.coroutines.flow.MutableStateFlow
+          data class Hit(val id: String, val pkg: String, val what: String, val snip: String, val patch: String)
+          object Repo {
+              private val ring = Ring<String>(4000)
+              private val hits = Ring<Hit>(400)
+              val logTick = MutableStateFlow(0)
+              val hitTick = MutableStateFlow(0)
+              val finds = MutableStateFlow<List<Finding>>(emptyList())
+              val queue = MutableStateFlow<Set<String>>(emptySet())
+              val msg = MutableStateFlow("")
+              fun log(l: String) { ring.add(l); logTick.value++ }
+              fun logs(): List<String> = ring.snapshot()
+              fun ruleHit(pkg: String, tag: String, msg: String) {
+                  val h = Learn.match(pkg, tag, msg) ?: return
+                  if (hits.snapshot().any { it.id == h.id && it.pkg == h.pkg }) return
+                  hits.add(h); hitTick.value++
+              }
+              fun hits(): List<Hit> = hits.snapshot()
+              fun toggle(id: String) { val s = queue.value; queue.value = if (id in s) s - id else s + id }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/rules/Learn.kt <<'XEOF'
+          package ai.venice.pw.rules
+          import android.content.Context
+          import ai.venice.pw.data.Hit
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          object Learn {
+              data class R(val id: String, val re: String, val what: String, val patch: String,
+                           var w: Double, var hits: Int, var ok: Int, var fail: Int)
+              private lateinit var f: File
+              private val rules = mutableListOf<R>()
+              @Volatile private var loaded = false
+              private val seed = listOf(
+                  R("su.path", "(?i)(su binary|found su|/system/xbin/su)", "su path", "prop.tags", .9, 0, 0, 0),
+                  R("magisk", "(?i)magisk", "magisk artifact", "denylist", .9, 0, 0, 0),
+                  R("testkeys", "test-keys", "test-keys build", "prop.tags", .95, 0, 0, 0),
+                  R("debug", "(?i)ro\\.debuggable", "debuggable", "prop.debuggable", .9, 0, 0, 0),
+                  R("sn", "(?i)(basicIntegrity|ctsProfileMatch).*false", "safetynet fail", "keybox", .95, 0, 0, 0),
+                  R("pi", "(?i)MEETS_(DEVICE|STRONG)", "integrity verdict", "keybox", .85, 0, 0, 0),
+                  R("xposed", "(?i)(xposed|lsposed)", "xposed", "denylist", .85, 0, 0, 0),
+                  R("frida", "(?i)(frida|27042)", "frida", "kill.frida", .9, 0, 0, 0),
+                  R("vb", "(?i)(verifiedbootstate|flash\\.locked)", "bootstate", "prop.verifiedboot", .9, 0, 0, 0),
+                  R("mount", "(?i)(/data/adb|worker)", "mount leak", "denylist", .95, 0, 0, 0),
+                  R("avc", "avc:\\s*denied", "selinux denial", "sepolicy", .8, 0, 0, 0),
+                  R("crash", "(?i)(FATAL EXCEPTION|tombstone)", "crash", "snapshot", .8, 0, 0, 0))
+              fun init(c: Context) { f = File(c.filesDir, "rules.json"); if (!loaded) { load(); loaded = true } }
+              private fun load() {
+                  rules.clear()
+                  if (f.exists()) runCatching {
+                      val a = JSONArray(f.readText())
+                      for (i in 0 until a.length()) {
+                          val o = a.getJSONObject(i)
+                          rules += R(o.getString("id"), o.getString("re"), o.getString("what"), o.getString("patch"),
+                              o.getDouble("w"), o.optInt("hits"), o.optInt("ok"), o.optInt("fail"))
+                      }
+                  }
+                  if (rules.isEmpty()) { rules += seed; save() }
+              }
+              fun save() {
+                  if (!::f.isInitialized) return
+                  runCatching {
+                      val a = JSONArray()
+                      rules.forEach { r ->
+                          a.put(JSONObject().apply {
+                              put("id", r.id); put("re", r.re); put("what", r.what); put("patch", r.patch)
+                              put("w", r.w); put("hits", r.hits); put("ok", r.ok); put("fail", r.fail)
+                          })
+                      }
+                      f.writeText(a.toString())
+                  }
+              }
+              fun add(re: String, what: String, patch: String): Boolean = runCatching {
+                  Regex(re); rules += R("user." + System.currentTimeMillis(), re, what, patch, .6, 0, 0, 0); save(); true
+              }.getOrDefault(false)
+              fun match(pkg: String, tag: String, msg: String): Hit? {
+                  val h = "$tag $msg"
+                  var best: R? = null
+                  for (r in rules) {
+                      if (!runCatching { Regex(r.re).containsMatchIn(h) }.getOrDefault(false)) continue
+                      if (best == null || r.w > best.w) best = r
+                  }
+                  val b = best ?: return null
+                  b.hits++; save()
+                  return Hit(b.id, pkg, b.what, msg.take(150), b.patch)
+              }
+              fun feedback(id: String, ok: Boolean) {
+                  val r = rules.find { it.id == id } ?: return
+                  if (ok) { r.ok++; r.w = (r.w + 0.05).coerceAtMost(1.0) } else { r.fail++; r.w = (r.w - 0.10).coerceAtLeast(0.05) }
+                  save()
+              }
+              fun dump(): String = rules.sortedByDescending { it.w }.joinToString("\n") { "%.2f  ${it.id}  ok=${it.ok} fail=${it.fail}".format(it.w) }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/patch/Perms.kt <<'XEOF'
+          package ai.venice.pw.patch
+          import ai.venice.pw.core.Shell
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          object Perms {
+              data class P(val name: String, val granted: Boolean)
+              suspend fun list(pkg: String): List<P> = withContext(Dispatchers.IO) {
+                  Shell.root("dumpsys package $pkg").lines().mapNotNull { l ->
+                      val t = l.trim()
+                      if (!t.startsWith("android.permission.")) null else P(t.substringBefore(':').trim(), t.contains("granted=true"))
+                  }.distinctBy { it.name }
+              }
+              suspend fun grant(p: String, x: String) = Shell.root("pm grant $p $x")
+              suspend fun revoke(p: String, x: String) = Shell.root("pm revoke $p $x")
+              suspend fun disable(p: String) = Shell.root("pm disable-user --user 0 $p")
+              suspend fun enable(p: String) = Shell.root("pm enable $p")
+              suspend fun tame(p: String) = withContext(Dispatchers.IO) {
+                  Shell.root("cmd deviceidle whitelist -$p 2>/dev/null; appops set $p WAKE_LOCK ignore 2>/dev/null; echo tamed")
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/patch/Tune.kt <<'XEOF'
+          package ai.venice.pw.patch
+          import ai.venice.pw.core.Shell
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          object Tune {
+              data class K(val key: String, val cur: String, val why: String)
+              private val keys = listOf("vm.swappiness" to "swap", "vm.dirty_ratio" to "write burst", "vm.vfs_cache_pressure" to "reclaim")
+              suspend fun read(): List<K> = withContext(Dispatchers.IO) {
+                  keys.map { (k, w) -> K(k, Shell.root("sysctl -n $k 2>/dev/null").ifBlank { "-" }, w) }
+              }
+              suspend fun write(k: String, v: String) = withContext(Dispatchers.IO) {
+                  val r = Shell.root("sysctl -w $k=$v"); if (r.contains("=")) "set $k=$v" else "failed"
+              }
+              suspend fun gov() = withContext(Dispatchers.IO) { Shell.root("cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").ifBlank { "n/a" } }
+              suspend fun setGov(g: String) = withContext(Dispatchers.IO) {
+                  Shell.root("for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo $g > \$c 2>/dev/null; done; echo $g")
+              }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/patch/Hider.kt <<'XEOF'
+          package ai.venice.pw.patch
+          import ai.venice.pw.core.Shell
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.UUID
+          object Hider {
+              suspend fun place(c: android.content.Context, xml: String, r: Boolean): String? = withContext(Dispatchers.IO) {
+                  val t = if (r) UUID.randomUUID().toString().take(12) else "default"
+                  val dest = "/data/adb/.kb/$t/kb.xml"
+                  val tmp = File(c.cacheDir, "kb.xml").apply { writeText(xml) }
+                  val ok = Shell.put(tmp, dest, "600"); tmp.delete(); if (ok) dest else null
+              }
+              suspend fun link(p: String) = withContext(Dispatchers.IO) {
+                  Shell.root("mkdir -p /data/adb/tricky_store; rm -f /data/adb/tricky_store/keybox.xml; ln -sf $p /data/adb/tricky_store/keybox.xml; echo linked")
+              }
+              suspend fun scrub() = withContext(Dispatchers.IO) { Shell.root("rm -f /data/adb/tricky_store/keybox.xml; echo scrubbed") }
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/patch/Module.kt <<'XEOF'
+          package ai.venice.pw.patch
+          import ai.venice.pw.core.Env
+          import ai.venice.pw.core.Shell
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipOutputStream
+          class Module(val id: String) {
+              private val steps = mutableListOf<String>()
+              private val undo = mutableListOf<String>()
+              fun prop(k: String, v: String) = apply { steps += "resetprop -n $k $v"; undo += "resetprop --delete $k" }
+              fun raw(l: String) = apply { steps += l }
+              suspend fun build(): File? = withContext(Dispatchers.IO) {
+                  if (!Env.state.canModule) return@withContext null
+                  val d = File("/data/local/tmp/pw").apply { mkdirs() }
+                  val z = File(d, "$id.zip")
+                  ZipOutputStream(z.outputStream().buffered()).use { o ->
+                      fun put(p: String, t: String) { o.putNextEntry(ZipEntry(p)); o.write(t.toByteArray()); o.closeEntry() }
+                      put("module.prop", "id=$id\nname=$id\nversion=1\nversionCode=1\nauthor=pw\n")
+                      put("post-fs-data.sh", "#!/system/bin/sh\nM=${'$'}{0%/*}\n" +
+                          "N=${'$'}(cat /data/adb/pw_cnt 2>/dev/null || echo 0); N=$((N+1)); echo ${'$'}N > /data/adb/pw_cnt\n" +
+                          "[ ${'$'}N -gt 3 ] && touch ${'$'}M/disable\n" +
+                          "${steps.joinToString("\n")}\necho 0 > /data/adb/pw_cnt\n")
+                      put("uninstall.sh", "#!/system/bin/sh\n${undo.joinToString("\n")}\n")
+                  }
+                  z
+              }
+              suspend fun install(z: File) = Shell.root("magisk --install-module ${z.absolutePath}")
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/patch/ApkPatcher.kt <<'XEOF'
+          package ai.venice.pw.patch
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.security.MessageDigest
+          import java.util.zip.Adler32
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipInputStream
+          import java.util.zip.ZipOutputStream
+          object ApkPatcher {
+              data class E(val from: String, val to: String) { val ok get() = from.toByteArray().size == to.toByteArray().size }
+              suspend fun patch(src: File, edits: List<E>, out: File): String = withContext(Dispatchers.IO) {
+                  val good = edits.filter { it.ok }
+                  val bad = edits.filterNot { it.ok }.map { it.from }
+                  var n = 0
+                  ZipInputStream(src.inputStream().buffered()).use { zi ->
+                      ZipOutputStream(out.outputStream().buffered()).use { zo ->
+                          while (true) {
+                              val e = zi.nextEntry ?: break
+                              var b = zi.readBytes()
+                              if (e.name == "AndroidManifest.xml") { val r = axml(b, good); b = r.first; n += r.second }
+                              else if (e.name.endsWith(".dex")) { val r = dex(b, good); if (r.second > 0) { b = fix(r.first); n += r.second } }
+                              zo.putNextEntry(ZipEntry(e.name)); zo.write(b); zo.closeEntry()
+                          }
+                      }
+                  }
+                  "patched $n" + if (bad.isEmpty()) "" else "\nmismatch: ${bad.joinToString()}"
+              }
+              private fun fix(b: ByteArray): ByteArray {
+                  val s = MessageDigest.getInstance("SHA-1"); s.update(b, 32, b.size - 32); s.digest().copyInto(b, 12)
+                  val a = Adler32(); a.update(b, 12, b.size - 12); val c = a.value
+                  for (i in 0 until 4) b[8 + i] = ((c shr (i * 8)) and 0xFF).toByte()
+                  return b
+              }
+              private fun axml(b: ByteArray, es: List<E>): Pair<ByteArray, Int> {
+                  var h = 0; var i = 8
+                  while (i + 8 <= b.size) {
+                      val t = u16(b, i); val hd = u16(b, i + 2); val s = i32(b, i + 4)
+                      if (s <= 0 || i + s > b.size) break
+                      if (t == 1 && hd >= 28) {
+                          val c = i32(b, i + 8); val f = i32(b, i + 16); val st = i32(b, i + 20)
+                          val u = f and 0x100 != 0
+                          for (k in 0 until c) {
+                              var p = i + st + i32(b, i + hd + k * 4)
+                              if (u) {
+                                  while (p < b.size && b[p].toInt() and 0x80 != 0) p++; p++
+                                  while (p < b.size && b[p].toInt() and 0x80 != 0) p++; p++
+                              } else p += 2
+                              for (e in es) {
+                                  val fr = e.from.toByteArray()
+                                  if (p >= 0 && p + fr.size <= b.size && b.copyOfRange(p, p + fr.size).contentEquals(fr)) {
+                                      e.to.toByteArray().copyInto(b, p); h++
+                                  }
+                              }
+                          }
+                      }
+                      i += s
+                  }
+                  return b to h
+              }
+              private fun dex(b: ByteArray, es: List<E>): Pair<ByteArray, Int> {
+                  var h = 0
+                  for (e in es) {
+                      val f = e.from.toByteArray(); val t = e.to.toByteArray(); var i = 0
+                      while (true) {
+                          i = find(b, f, i); if (i < 0) break
+                          if ((b.getOrNull(i - 1)?.toInt()?.and(0xFF) ?: 0) == f.size) { t.copyInto(b, i); h++ }
+                          i += f.size
+                      }
+                  }
+                  return b to h
+              }
+              private fun find(h: ByteArray, n: ByteArray, s: Int): Int {
+                  o@ for (i in s..h.size - n.size) { for (j in n.indices) if (h[i + j] != n[j]) continue@o; return i }
+                  return -1
+              }
+              private fun u16(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+              private fun i32(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
+                  ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
+          }
+          XEOF
+
+          cat > app/src/main/java/ai/venice/pw/ui/MainActivity.kt <<'XEOF'
+          package ai.venice.pw.ui
+          import android.Manifest
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.lifecycle.lifecycleScope
+          import ai.venice.pw.core.*
+          import ai.venice.pw.data.Repo
+          import ai.venice.pw.patch.*
+          import ai.venice.pw.rules.Learn
+          import kotlinx.coroutines.launch
+          class MainActivity : ComponentActivity() {
+              private val np = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) np.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  lifecycleScope.launch { Shell.detect() }
+                  setContent { MaterialTheme { Root() } }
+              }
+              @OptIn(ExperimentalMaterial3Api::class)
+              @Composable
+              private fun Root() {
+                  var tab by remember { mutableIntStateOf(0) }
+                  var sel by remember { mutableStateOf(setOf<String>()) }
+                  var pkg by remember { mutableStateOf("") }
+                  val tabs = listOf("Env", "Scan", "Live", "Hits", "Perms", "Tune", "Patch", "APK", "Keybox", "Modem", "Attest", "Learn")
+                  Scaffold(topBar = {
+                      Column {
+                          TopAppBar(title = { Text("Patchwright", fontSize = 16.sp) }, actions = { Text("${Shell.mode}  ", fontSize = 10.sp) })
+                          ScrollableTabRow(selectedTabIndex = tab, edgePadding = 0.dp) {
+                              tabs.forEachIndexed { i, t -> Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t, fontSize = 9.sp) }) }
+                          }
+                      }
+                  }) { p ->
+                      Box(Modifier.padding(p).fillMaxSize()) {
+                          when (tab) {
+                              0 -> EnvTab(); 1 -> ScanTab(); 2 -> LiveTab(); 3 -> HitsTab()
+                              4 -> PermsTab(pkg) { pkg = it }; 5 -> TuneTab()
+                              6 -> PatchTab(sel) { sel = it }; 7 -> ApkTab(); 8 -> KeyboxTab()
+                              9 -> ModemTab(); 10 -> AttestTab(); else -> LearnTab()
+                          }
+                      }
+                  }
+              }
+              @Composable
+              private fun EnvTab() {
+                  var s by remember { mutableStateOf(Env.state) }
+                  Column(Modifier.padding(12.dp).verticalScroll(rememberScrollState())) {
+                      Button(onClick = { lifecycleScope.launch { s = Env.refresh() } }) { Text("Verify environment") }
+                      Spacer(Modifier.height(8.dp))
+                      Text(listOf("root" to s.root, "magisk" to s.magisk, "kernelsu" to s.kernelsu, "apatch" to s.apatch,
+                          "resetprop" to s.resetprop, "magiskpolicy" to s.magiskpolicy, "tricky" to s.tricky,
+                          "zipalign" to s.zipalign, "apksigner" to s.apksigner)
+                          .joinToString("\n") { "${it.first}: ${if (it.second) "yes" else "no"}" },
+                          fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+                      Spacer(Modifier.height(8.dp))
+                      Text(if (s.canPatch) "patching enabled" else "read only, no root backend", fontSize = 11.sp)
+                  }
+              }
+              @Composable
+              private fun ScanTab() {
+                  val f by Repo.finds.collectAsState()
+                  Column(Modifier.padding(8.dp)) {
+                      Button(onClick = { lifecycleScope.launch { Repo.finds.value = Surface.props() + Surface.paths() + Surface.misc() } }) { Text("Scan") }
+                      LazyColumn { items(f) { x -> ListItem(headlineContent = { Text(x.id, fontSize = 11.sp) }, supportingContent = { Text(x.detail, fontSize = 10.sp) }) } }
+                  }
+              }
+              @Composable
+              private fun LiveTab() {
+                  val t by Repo.logTick.collectAsState()
+                  val l = remember(t) { Repo.logs() }
+                  Column(Modifier.padding(6.dp)) {
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Button(onClick = { LogReader.start(this@MainActivity) }) { Text("Start", fontSize = 11.sp) }
+                          OutlinedButton(onClick = { LogReader.stop(this@MainActivity) }) { Text("Stop", fontSize = 11.sp) }
+                      }
+                      LazyColumn { items(l) { Text(it, fontFamily = FontFamily.Monospace, fontSize = 8.sp) } }
+                  }
+              }
+              @Composable
+              private fun HitsTab() {
+                  val t by Repo.hitTick.collectAsState()
+                  val h = remember(t) { Repo.hits() }
+                  LazyColumn(Modifier.padding(6.dp)) {
+                      items(h) { x ->
+                          Card(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
+                              Column(Modifier.padding(6.dp)) {
+                                  Text("${x.pkg} · ${x.id}", fontSize = 11.sp); Text(x.what, fontSize = 10.sp)
+                                  Row {
+                                      TextButton(onClick = { Repo.toggle(x.patch) }) { Text("queue", fontSize = 10.sp) }
+                                      TextButton(onClick = { Learn.feedback(x.id, true) }) { Text("worked", fontSize = 10.sp) }
+                                      TextButton(onClick = { Learn.feedback(x.id, false) }) { Text("failed", fontSize = 10.sp) }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              @Composable
+              private fun PermsTab(pkg: String, set: (String) -> Unit) {
+                  var l by remember { mutableStateOf<List<Perms.P>>(emptyList()) }
+                  val m by Repo.msg.collectAsState()
+                  Column(Modifier.padding(8.dp)) {
+                      OutlinedTextField(value = pkg, onValueChange = set, label = { Text("package") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Button(onClick = { lifecycleScope.launch { l = Perms.list(pkg) } }) { Text("Load", fontSize = 10.sp) }
+                          OutlinedButton(onClick = { lifecycleScope.launch { Repo.msg.value = Perms.tame(pkg) } }) { Text("Tame", fontSize = 10.sp) }
+                          OutlinedButton(onClick = { lifecycleScope.launch { Repo.msg.value = Perms.disable(pkg) } }) { Text("Off", fontSize = 10.sp) }
+                          OutlinedButton(onClick = { lifecycleScope.launch { Repo.msg.value = Perms.enable(pkg) } }) { Text("On", fontSize = 10.sp) }
+                      }
+                      Text(m, fontSize = 10.sp)
+                      LazyColumn {
+                          items(l) { p ->
+                              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                  Switch(checked = p.granted, onCheckedChange = { on ->
+                                      lifecycleScope.launch { if (on) Perms.grant(pkg, p.name) else Perms.revoke(pkg, p.name); l = Perms.list(pkg) }
+                                  })
+                                  Text(p.name.removePrefix("android.permission."), fontSize = 10.sp)
+                              }
+                          }
+                      }
+                  }
+              }
+              @Composable
+              private fun TuneTab() {
+                  var k by remember { mutableStateOf<List<Tune.K>>(emptyList()) }
+                  val m by Repo.msg.collectAsState()
+                  var g by remember { mutableStateOf("") }
+                  Column(Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          Button(onClick = { lifecycleScope.launch { k = Tune.read(); g = Tune.gov() } }) { Text("Read", fontSize = 10.sp) }
+                          OutlinedButton(onClick = { lifecycleScope.launch { Repo.msg.value = Tune.setGov("schedutil") } }) { Text("schedutil", fontSize = 10.sp) }
+                      }
+                      Text("governor $g", fontSize = 10.sp); Text(m, fontSize = 10.sp)
+                      k.forEach { x ->
+                          Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                              Column(Modifier.weight(1f)) { Text(x.key, fontSize = 11.sp); Text("${x.cur} · ${x.why}", fontSize = 9.sp) }
+                              TextButton(onClick = { lifecycleScope.launch { Repo.msg.value = Tune.write(x.key, x.cur) } }) { Text("set", fontSize = 10.sp) }
+                          }
+                      }
+                  }
+              }
+              @Composable
+              private fun PatchTab(sel: Set<String>, set: (Set<String>) -> Unit) {
+                  val m by Repo.msg.collectAsState()
+                  Column(Modifier.padding(8.dp)) {
+                      Button(onClick = {
+                          lifecycleScope.launch {
+                              val id = "pw" + System.currentTimeMillis().toString().takeLast(6)
+                              val mod = Module(id)
+                              sel.forEach { s ->
+                                  when (s) {
+                                      "prop.tags" -> mod.prop("ro.build.tags", "release-keys").prop("ro.debuggable", "0")
+                                      "prop.verifiedboot" -> mod.prop("ro.boot.flash.locked", "1").prop("ro.boot.verifiedbootstate", "green")
+                                      "prop.emulator" -> mod.prop("ro.kernel.qemu", "0")
+                                      "denylist" -> mod.raw("magisk --denylist enforce 2>/dev/null")
+                                      "kill.frida" -> mod.raw("pkill -f frida-server 2>/dev/null")
+                                      "tune.vm" -> mod.raw("sysctl -w vm.swappiness=40 2>/dev/null")
+                                      "sepolicy" -> mod.raw("magiskpolicy --live 'allow untrusted_app system_file file { read }' 2>/dev/null")
+                                      "keybox" -> mod.raw("cp /data/adb/pw/keybox.xml /data/adb/tricky_store/keybox.xml 2>/dev/null")
+                                  }
+                              }
+                              val z = mod.build()
+                              Repo.msg.value = if (z == null) "need magisk" else mod.install(z)
+                          }
+                      }) { Text("Build + install (${sel.size})") }
+                      Text(m, fontSize = 10.sp)
+                      LazyColumn {
+                          items(listOf("prop.tags", "prop.verifiedboot", "prop.emulator", "denylist", "kill.frida", "tune.vm", "sepolicy", "keybox")) { id ->
+                              Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                  Checkbox(checked = id in sel, onCheckedChange = { set(if (id in sel) sel - id else sel + id) })
+                                  Text(id, fontSize = 11.sp)
+                              }
+                          }
+                      }
+                  }
+              }
+              @Composable
+              private fun ApkTab() {
+                  val ctx = LocalContext.current
+                  val m by Repo.msg.collectAsState()
+                  var src by remember { mutableStateOf<Uri?>(null) }
+                  var edits by remember { mutableStateOf("test-keys->release-keyz") }
+                  val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { src = it }
+                  Column(Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
+                      Button(onClick = { pick.launch(arrayOf("*/*")) }) { Text("Pick APK") }
+                      Text(src?.lastPathSegment ?: "none", fontSize = 10.sp)
+                      OutlinedTextField(value = edits, onValueChange = { edits = it }, label = { Text("from->to per line") }, modifier = Modifier.fillMaxWidth().height(110.dp))
+                      Button(onClick = {
+                          lifecycleScope.launch {
+                              val u = src ?: return@launch
+                              val es = edits.lines().mapNotNull { val p = it.split("->"); if (p.size == 2) ApkPatcher.E(p[0].trim(), p[1].trim()) else null }
+                              val d = java.io.File(ctx.cacheDir, "apk").apply { mkdirs() }
+                              val i = java.io.File(d, "i.apk"); val o = java.io.File(d, "o.apk")
+                              ctx.contentResolver.openInputStream(u)?.use { x -> i.outputStream().use { x.copyTo(it) } }
+                              var r = ApkPatcher.patch(i, es, o)
+                              val al = java.io.File(d, "a.apk")
+                              Shell.exec("zipalign -p -f 4 ${o.absolutePath} ${al.absolutePath}")
+                              val ks = java.io.File(d, "k.jks")
+                              if (!ks.exists()) Shell.exec("keytool -genkeypair -keystore ${ks.absolutePath} -alias k -keyalg EC -groupname secp256r1 -validity 10000 -storepass pw123456 -keypass pw123456 -dname CN=pw")
+                              val sg = java.io.File(d, "s.apk")
+                              Shell.exec("apksigner sign --ks ${ks.absolutePath} --ks-pass pass:pw123456 --key-pass pass:pw123456 --out ${sg.absolutePath} ${al.absolutePath}")
+                              Repo.msg.value = r + "\nsigned ${sg.absolutePath}"
+                          }
+                      }) { Text("Patch + sign") }
+                      Text(m, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
+                  }
+              }
+              @Composable
+              private fun KeyboxTab() {
+                  val ctx = LocalContext.current
+                  val m by Repo.msg.collectAsState()
+                  var path by remember { mutableStateOf<String?>(null) }
+                  val pick = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { u ->
+                      u ?: return@rememberLauncherForActivityResult
+                      lifecycleScope.launch {
+                          val x = ctx.contentResolver.openInputStream(u)?.bufferedReader()?.readText() ?: return@launch
+                          val k = Keybox.parse(x)
+                          Repo.msg.value = "${k.st} certs=${k.certs.size} days=${k.days} test=${Keybox.test(k)}\n${k.notes.joinToString("\n")}"
+                          if (k.st == Keybox.S.VALID) { KeyboxStore.save(ctx, Keybox.xml(k)); Repo.msg.value += "\nstored" }
+                      }
+                  }
+                  Column(Modifier.padding(10.dp).verticalScroll(rememberScrollState())) {
+                      Button(onClick = { pick.launch(arrayOf("*/*")) }) { Text("Import keybox") }
+                      Text(m, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                      Button(onClick = { lifecycleScope.launch { val x = KeyboxStore.load(ctx) ?: return@launch; path = Hider.place(ctx, x, true); Repo.msg.value = "placed $path" } }) { Text("Place") }
+                      Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                          OutlinedButton(onClick = { lifecycleScope.launch { path?.let { Repo.msg.value = Hider.link(it) } } }) { Text("Link") }
+                          OutlinedButton(onClick = { lifecycleScope.launch { Repo.msg.value = Hider.scrub() } }) { Text("Scrub") }
+                      }
+                  }
+              }
+              @Composable
+              private fun ModemTab() {
+                  var r by remember { mutableStateOf<Modem.Report?>(null) }
+                  Column(Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
+                      Button(onClick = { lifecycleScope.launch { r = Modem.diagnose() } }) { Text("Diagnose") }
+                      r?.let { Text(it.verdict, fontSize = 12.sp); Text(it.lines.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 8.sp); Text(it.plan, fontFamily = FontFamily.Monospace, fontSize = 9.sp) }
+                  }
+              }
+              @Composable
+              private fun AttestTab() {
+                  var t by remember { mutableStateOf("not run") }
+                  Column(Modifier.padding(8.dp)) {
+                      Button(onClick = { lifecycleScope.launch { t = Attest.probe() } }) { Text("Read real TEE") }
+                      Text(t, fontFamily = FontFamily.Monospace, fontSize = 10.sp)
+                  }
+              }
+              @Composable
+              private fun LearnTab() {
+                  var d by remember { mutableStateOf("") }
+                  var re by remember { mutableStateOf("") }
+                  var what by remember { mutableStateOf("") }
+                  var patch by remember { mutableStateOf("prop.tags") }
+                  Column(Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
+                      Text("worked +0.05, failed -0.10", fontSize = 10.sp)
+                      Button(onClick = { d = Learn.dump() }) { Text("Show rules") }
+                      Text(d, fontFamily = FontFamily.Monospace, fontSize = 8.sp)
+                      OutlinedTextField(value = re, onValueChange = { re = it }, label = { Text("regex") }, modifier = Modifier.fillMaxWidth())
+                      OutlinedTextField(value = what, onValueChange = { what = it }, label = { Text("meaning") }, modifier = Modifier.fillMaxWidth())
+                      OutlinedTextField(value = patch, onValueChange = { patch = it }, label = { Text("patch id") }, modifier = Modifier.fillMaxWidth())
+                      Button(onClick = { if (Learn.add(re, what, patch)) { re = ""; what = ""; d = Learn.dump() } }) { Text("Add rule") }
+                  }
+              }
+          }
+          XEOF
+
+      - name: sdk
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: app/build/outputs/apk/debug/*.apk
