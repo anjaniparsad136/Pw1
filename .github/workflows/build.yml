@@ -19,13 +19,23 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - uses: android-actions/setup-android@v3
-
-      - name: SDK packages
+      - name: Setup Android SDK (no obsolete tools package)
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+          ANDROID_HOME="${HOME}/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          cd /tmp
+          curl -fsSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          rm -rf cmdline-tools
+          unzip -q cmdtools.zip
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          mv cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          yes | sdkmanager --sdk_root="$ANDROID_HOME" --licenses >/dev/null || true
+          sdkmanager --sdk_root="$ANDROID_HOME" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
 
       - name: Write project
         run: |
@@ -1345,7 +1355,7 @@ jobs:
           }
           EOF
 
-          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          echo "sdk.dir=${ANDROID_HOME}" > local.properties
           find app/src -type f | wc -l
 
       - name: Build
