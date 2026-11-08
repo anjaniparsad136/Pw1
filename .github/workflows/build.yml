@@ -440,7 +440,7 @@ jobs:
             )
             suspend fun diagnose(): Report = withContext(Dispatchers.IO) {
               val lines = mutableListOf<String>()
-              fun add(cmd: String, label: String) {
+              suspend fun add(cmd: String, label: String) {
                 val o = Shell.root(cmd).lines().filter { it.isNotBlank() }.take(60)
                 lines += "===== $label ====="
                 lines += o.ifEmpty { listOf("(empty)") }
