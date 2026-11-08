@@ -72,7 +72,7 @@ jobs:
 
           cat > build.gradle.kts <<'EOF'
           plugins {
-            id("com.android.application") version "8.7.2" apply false
+            id("com.android.application") version "8.5.2" apply false
             id("org.jetbrains.kotlin.android") version "2.0.21" apply false
             id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
           }
@@ -1462,11 +1462,18 @@ jobs:
       - name: Build
         run: |
           set -euo pipefail
+          test -n "${ANDROID_HOME:-}"
           echo "sdk.dir=${ANDROID_HOME}" > local.properties
+          cat local.properties
           gradle --version
+          # Print first failure causes clearly
+          set +e
           gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
-          if grep -q "^e: " build.log; then echo "---- KOTLIN ERRORS ----"; grep -n "^e: " build.log | head -40; fi
-          if grep -q "BUILD FAILED" build.log; then exit 1; fi
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "---- first errors ----"
+          grep -E "^e: |error: |FAILURE: |What went wrong:|Could not|SDK location" build.log | head -50 || true
+          if [ "$code" -ne 0 ]; then exit "$code"; fi
           ls -la app/build/outputs/apk/debug/
 
       - name: Verify strings in APK
