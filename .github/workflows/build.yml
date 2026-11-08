@@ -16,13 +16,11 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
-      - name: Run sdkmanager
-        env:
-          ANDROID_HOME: /usr/local/lib/android/sdk
-        run: |
-          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
-          sdkmanager --sdk_root=${ANDROID_HOME} --licenses || true
-          sdkmanager --sdk_root=${ANDROID_HOME} "platforms;android-35" "build-tools;35.0.0"
+      - name: Accept Android SDK Licenses Automatically
+          run: |
+            mkdir -p /usr/local/lib/android/sdk/licenses
+            echo "24333f0d63266f7550456170d6526017b2b52b31" > /usr/local/lib/android/sdk/licenses/android-sdk-license
+            echo "84831b400904a625014312442624b864d08ee730" >> /usr/local/lib/android/sdk/licenses/android-sdk-license
 
 
       
