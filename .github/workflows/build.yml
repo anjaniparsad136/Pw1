@@ -415,65 +415,111 @@ jobs:
           }
           EOF
 
-                    cat > app/src/main/java/ai/venice/pw/core/Modem.kt <<'EOF'
+                              cat > app/src/main/java/ai/venice/pw/core/Modem.kt <<'EOF'
           package ai.venice.pw.core
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.withContext
           /**
-           * Read-only modem/EFS diagnostics.
-           * Knows common Qualcomm EFS-related names: modemst1, modemst2, fsg, fsc.
-           * NEVER writes those partitions from this app.
+           * Xperia / Qualcomm-oriented modem + EFS diagnostics (READ-ONLY).
+           * Tracks: modemst1, modemst2, fsg, fsc, persist, efs-related by-name nodes,
+           * baseband, mcfg-related props, radio logcat.
+           * NEVER writes modemst1/st2/fsg/fsc/persist/efs partitions.
+           * Can emit a copyable report + safe Magisk prop-side hints only.
            */
           object Modem {
-            data class Report(val verdict: String, val lines: List<String>, val plan: String)
-            private val efsNames = listOf("modemst1", "modemst2", "fsg", "fsc", "modem", "mdm1m9kefs1", "mdm1m9kefs2", "mdm1m9kefsc")
+            data class Report(
+              val verdict: String,
+              val lines: List<String>,
+              val plan: String,
+              val copyBlob: String,
+              val safePatchIds: List<String>
+            )
+            private val efsNames = listOf(
+              "modemst1", "modemst2", "fsg", "fsc", "persist", "efs", "efs1", "efs2", "efsc",
+              "modem", "mdm1m9kefs1", "mdm1m9kefs2", "mdm1m9kefsc", "fsg_bak"
+            )
             suspend fun diagnose(): Report = withContext(Dispatchers.IO) {
               val lines = mutableListOf<String>()
               fun add(cmd: String, label: String) {
-                val o = Shell.root(cmd).lines().filter { it.isNotBlank() }.take(40)
-                lines += "# $label"
+                val o = Shell.root(cmd).lines().filter { it.isNotBlank() }.take(60)
+                lines += "===== $label ====="
                 lines += o.ifEmpty { listOf("(empty)") }
               }
-              add("getprop | grep -iE 'gsm|ril|radio|operator|network|baseband|mcfg|persist.vendor.radio|ro.baseband'", "radio props")
-              add("dumpsys telephony.registry 2>/dev/null | head -50", "telephony.registry")
-              add("logcat -b radio -d 2>/dev/null | tail -50", "radio log tail")
-              add("ls -l /dev/block/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|st1|st2'", "by-name partitions")
-              add("ls -l /dev/block/bootdevice/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|st1|st2'", "bootdevice by-name")
-              // Presence only — no read of raw partition contents (privacy + safety)
+              add("getprop ro.product.model; getprop ro.product.device; getprop ro.product.name; getprop ro.hardware; getprop ro.boot.hardware", "device")
+              add("getprop | grep -iE 'gsm|ril|radio|operator|network|baseband|mcfg|sony|semc|persist.vendor.radio|persist.radio|ro.telephony|sys.radio'", "radio/mcfg props")
+              add("getprop ro.baseband; getprop gsm.version.baseband; getprop persist.radio.multisim.config; getprop gsm.sim.state; getprop gsm.operator.alpha", "baseband/sim")
+              add("dumpsys telephony.registry 2>/dev/null | head -80", "telephony.registry")
+              add("logcat -b radio -d 2>/dev/null | tail -80", "radio buffer tail")
+              add("logcat -d 2>/dev/null | grep -iE 'mcfg|modemst|EFS|RIL|QMI|qmi|oem_qmi|NO_SERVICE|OUT_OF_SERVICE|not searching|RADIO_OFF' | tail -80", "filtered main log")
+              add("ls -l /dev/block/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|persist|st1|st2'", "by-name")
+              add("ls -l /dev/block/bootdevice/by-name 2>/dev/null | grep -iE 'modem|fsg|fsc|efs|persist|st1|st2'", "bootdevice by-name")
               for (n in efsNames) {
-                val hit = Shell.root("ls -l /dev/block/by-name/$n /dev/block/bootdevice/by-name/$n 2>/dev/null")
-                if (hit.isNotBlank() && !hit.startsWith("ERR")) {
-                  lines += "# partition $n"
+                val hit = Shell.root(
+                  "ls -l /dev/block/by-name/$n /dev/block/bootdevice/by-name/$n 2>/dev/null; " +
+                    "toybox ls -l /dev/block/by-name/$n 2>/dev/null"
+                )
+                if (hit.isNotBlank() && !hit.contains("No such") && !hit.startsWith("ERR")) {
+                  lines += "===== node $n ====="
                   lines += hit.lines().filter { it.isNotBlank() }
                 }
               }
-              add("getprop ro.boot.baseband; getprop gsm.version.baseband; getprop persist.radio.multisim.config", "baseband/multisim")
-              val hasSt1 = lines.any { it.contains("modemst1") }
-              val hasSt2 = lines.any { it.contains("modemst2") }
-              val hasFsg = lines.any { it.contains("fsg") }
-              val hasFsc = lines.any { it.contains("fsc") }
-              lines += "# efs-related nodes: modemst1=$hasSt1 modemst2=$hasSt2 fsg=$hasFsg fsc=$hasFsc"
-              val noSvc = lines.any { it.contains("OUT_OF_SERVICE", true) || it.contains("not searching", true) }
+              // Size only via blockdev if present — still not dumping contents
+              add(
+                "for n in modemst1 modemst2 fsg fsc persist; do " +
+                  "p=/dev/block/by-name/\$n; " +
+                  "[ -e \$p ] || p=/dev/block/bootdevice/by-name/\$n; " +
+                  "if [ -e \$p ]; then echo -n \"\$n \"; blockdev --getsize64 \$p 2>/dev/null || wc -c < \$p; fi; done",
+                "partition sizes (bytes)"
+              )
+              val joined = lines.joinToString("\n")
+              val hasSt1 = joined.contains("modemst1")
+              val hasSt2 = joined.contains("modemst2")
+              val hasFsg = Regex("\\bfsg\\b").containsMatchIn(joined)
+              val hasFsc = Regex("\\bfsc\\b").containsMatchIn(joined)
+              val hasPersist = joined.contains("persist")
+              val mcfgFail = Regex("(?i)mcfg.*fail|failed.*mcfg|mcfg_.*error").containsMatchIn(joined)
+              val noSvc = Regex("(?i)OUT_OF_SERVICE|not searching|RADIO_UNAVAILABLE|RADIO_OFF").containsMatchIn(joined)
+              val qmiErr = Regex("(?i)qmi.*fail|oem_qmi|QMI_ERR").containsMatchIn(joined)
+              lines += "===== summary flags ====="
+              lines += "modemst1=$hasSt1 modemst2=$hasSt2 fsg=$hasFsg fsc=$hasFsc persist_node=$hasPersist"
+              lines += "mcfgFail=$mcfgFail noSvc=$noSvc qmiErr=$qmiErr"
+              val safe = mutableListOf<String>()
               val verdict = when {
-                lines.any { it.contains("mcfg", true) && it.contains("fail", true) } ->
-                  "Possible mcfg/config issue. Restore EFS (modemst1/2, fsg, fsc) from YOUR backup only."
-                noSvc && (hasSt1 || hasFsg) ->
-                  "No service + EFS nodes present. Likely bad EFS/mcfg write earlier — restore backup, do not random-flash."
-                noSvc ->
-                  "Radio out of service — check SIM, baseband prop, and whether modemst1/st2/fsg/fsc were modified."
-                else ->
-                  "Collected modem/EFS node info. App does not write modemst1, modemst2, fsg, or fsc."
+                mcfgFail || (noSvc && (hasSt1 || hasFsg)) -> {
+                  safe += "snapshot"
+                  "Likely EFS/mcfg damage or mismatch (Xperia-style modemst1/st2/fsg/fsc). Restore from YOUR backup offline — app will not flash those partitions."
+                }
+                qmiErr && noSvc -> {
+                  safe += "snapshot"
+                  "QMI/RIL errors with no service. Collect report; often needs EFS restore or stock modem reflash outside this app."
+                }
+                noSvc -> {
+                  safe += "snapshot"
+                  "No cellular service. Check SIM, airplane mode, baseband prop, and whether modemst*/fsg/fsc were written recently."
+                }
+                else -> "Modem/EFS nodes inspected. No automatic partition write available (by design)."
               }
               val plan = """
-                SAFE PLAN (manual — this app never flashes these):
-                Partitions often involved on Qualcomm: modemst1, modemst2, fsg, fsc
-                1) If radio broke after mcfg/EFS write: restore those partitions from a backup taken on THIS phone before the change.
-                2) Tools: model-specific (QPST/QFIL/client EFS explore) — not Magisk zip guesswork.
-                3) Matching firmware + region mcfg required.
-                4) After restore: reboot, test network search, *#*#4636#*#* if available.
-                5) Do not format fsg/fsc unless you know your device policy; empty FSG recovery is device-specific.
+                XPERIA / QUALCOMM SAFE PLAN
+                Related partitions: modemst1, modemst2, fsg, fsc, persist (device-dependent)
+                THIS APP: diagnose + copyable log only. It does NOT write st1/st2/fsg/fsc/persist.
+
+                If network search died after mcfg/EFS experiment:
+                1) Stop flashing more mcfg into EFS.
+                2) Restore modemst1 + modemst2 (+ fsg/fsc if your backup includes them) from a backup made on THIS phone before the break.
+                3) Use Sony/Xperia-appropriate tools (newflasher/Emma/QFIL-style only if you know the model pack) — not a random Magisk zip.
+                4) Matching firmware build + region matters for mcfg.
+                5) After restore: reboot, test service, dial *#*#4636#*#* if available.
+                6) Paste the COPY BLOB below into Google/AI for a second opinion — do not grant tools write access to EFS blindly.
               """.trimIndent()
-              Report(verdict, lines, plan)
+              val copyBlob = buildString {
+                appendLine("PATCHWRIGHT MODEM REPORT")
+                appendLine("verdict: $verdict")
+                appendLine(lines.joinToString("\n"))
+                appendLine("--- PLAN ---")
+                appendLine(plan)
+              }
+              Report(verdict, lines, plan, copyBlob, safe.distinct())
             }
           }
           EOF
@@ -1332,16 +1378,27 @@ jobs:
               }
             }
 
-            @Composable private fun ModemTab() {
+                        @Composable private fun ModemTab() {
               var r by remember { mutableStateOf<Modem.Report?>(null) }
+              val m by Repo.msg.collectAsState()
               Column(Modifier.padding(8.dp).verticalScroll(rememberScrollState())) {
-                Text("Diagnose only — never writes EFS/mcfg from this app.", fontSize = 10.sp)
-                Button(onClick = { lifecycleScope.launch { r = Modem.diagnose() } }) { Text("Diagnose") }
-                r?.let {
-                  Text(it.verdict, fontSize = 12.sp)
-                  Text(it.lines.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 8.sp)
-                  Text(it.plan, fontFamily = FontFamily.Monospace, fontSize = 9.sp)
+                Text("Xperia/Qualcomm: modemst1 modemst2 fsg fsc persist — READ ONLY", fontSize = 10.sp)
+                Text("No writes to EFS partitions. Copy report to share with AI/search.", fontSize = 10.sp)
+                Button(onClick = { lifecycleScope.launch { r = Modem.diagnose() } }) { Text("Diagnose modem/EFS") }
+                r?.let { rep ->
+                  Text(rep.verdict, fontSize = 12.sp)
+                  Text(rep.plan, fontFamily = FontFamily.Monospace, fontSize = 9.sp)
+                  Text("safe queue hints: ${rep.safePatchIds.joinToString()}", fontSize = 10.sp)
+                  Button(onClick = {
+                    rep.safePatchIds.forEach { Repo.toggle(it) }
+                    Repo.msg.value = "queued ${rep.safePatchIds} — use Patch tab (snapshot only, no EFS flash)"
+                  }) { Text("Queue safe snapshot-only items") }
+                  Button(onClick = { Repo.msg.value = rep.copyBlob.take(8000) }) { Text("Load copyable report into message") }
+                  Text("---- copyable report (scroll / select) ----", fontSize = 10.sp)
+                  Text(rep.copyBlob, fontFamily = FontFamily.Monospace, fontSize = 7.sp)
+                  Text(rep.lines.joinToString("\n"), fontFamily = FontFamily.Monospace, fontSize = 7.sp)
                 }
+                Text(m, fontSize = 9.sp, fontFamily = FontFamily.Monospace)
               }
             }
 
@@ -1407,7 +1464,10 @@ jobs:
           set -euo pipefail
           gradle wrapper --gradle-version 8.9
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace --continue 2>&1 | tee build.log
+          if grep -q "^e: " build.log; then echo "---- KOTLIN ERRORS ----"; grep -n "^e: " build.log | head -40; fi
+          if grep -q "BUILD FAILED" build.log; then exit 1; fi
+          test -f app/build/outputs/apk/debug/*.apk || ls app/build/outputs/apk/debug/ || exit 1
 
       - name: Verify strings in APK
         run: |
