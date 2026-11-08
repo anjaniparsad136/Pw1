@@ -1482,9 +1482,13 @@ jobs:
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
           echo "APK=$APK"
           ls -lh "$APK"
-          strings "$APK" | grep -E "getprop|magisk|logcat|resetprop|LogReader|ai/venice/pw" | head -30
-          strings "$APK" | grep -q getprop
-          strings "$APK" | grep -q logcat
+          # Avoid broken-pipe exit from head under pipefail
+          set +o pipefail
+          strings "$APK" | grep -E "getprop|magisk|logcat|resetprop|LogReader|ai/venice/pw" | head -40 || true
+          set -o pipefail
+          strings "$APK" | grep -F "getprop" >/dev/null
+          strings "$APK" | grep -F "logcat" >/dev/null
+          strings "$APK" | grep -F "magisk" >/dev/null
           echo OK
 
       - uses: actions/upload-artifact@v4
